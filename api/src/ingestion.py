@@ -31,6 +31,43 @@ def chunked(items: List[T], size: int) -> Iterable[List[T]]:
         yield items[i : i + size]
 
 
+def _open_csv_dictreader(csv_path: Path, expected_headers: List[str]) -> csv.DictReader:
+    """
+    Soporta CSV con o sin headers.
+    - utf-8-sig elimina BOM
+    - Sniffer detecta delimitador
+    - Si la primera fila NO parece header, asigna expected_headers y trata la primera fila como data.
+    """
+    f = csv_path.open("r", encoding="utf-8-sig", newline="")
+    sample = f.read(4096)
+    f.seek(0)
+
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;|\t")
+    except csv.Error:
+        dialect = csv.excel
+
+    # Lee primera fila para detectar si hay header
+    pos = f.tell()
+    first_line = f.readline()
+    f.seek(pos)
+
+    # Parse de primera fila para comparar con expected headers
+    first_row = next(csv.reader([first_line], dialect=dialect), [])
+    first_row_norm = [c.strip().lower() for c in first_row]
+    expected_norm = [c.strip().lower() for c in expected_headers]
+
+    has_header = first_row_norm == expected_norm
+
+    if has_header:
+        return csv.DictReader(f, dialect=dialect)
+
+    # No tiene header: DictReader con fieldnames fijos + saltar “header” manualmente
+    reader = csv.DictReader(f, fieldnames=expected_headers, dialect=dialect)
+    return reader
+
+
+
 # =========================
 # Helpers DQ
 # =========================
@@ -115,23 +152,40 @@ def ingest_departments(csv_path: Path, run_id: str) -> Dict[str, Any]:
     payload: List[Dict[str, Any]] = []
     source = csv_path.name
 
-    with csv_path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            raw = dict(row)
-            rid = _parse_int(raw.get("id"))
-            department = (raw.get("department") or "").strip()
+    reader = _open_csv_dictreader(csv_path, expected_headers=["id", "department"])
+    f = reader._fieldnames  # type: ignore[attr-defined]
+    if not f or "id" not in (f or []) or "department" not in (f or []):
+        # headers inesperados => rechazar todo con motivo claro
+        return {
+            "source": source,
+            "table": "departments",
+            "inserted": 0,
+            "rejected": 0,
+            "reasons": {"invalid_headers": 1, "headers_seen": 1},
+            "headers_seen": f,
+        }
 
-            if rid is None:
-                rejected += 1
-                _bump(reasons, "invalid_id")
-                continue
-            if not department:
-                rejected += 1
-                _bump(reasons, "empty_department")
-                continue
+    for row in reader:
+        raw = dict(row)
+        rid = _parse_int(raw.get("id"))
+        department = (raw.get("department") or "").strip()
 
-            payload.append({"id": rid, "department": department})
+        if rid is None:
+            rejected += 1
+            _bump(reasons, "invalid_id")
+            continue
+        if not department:
+            rejected += 1
+            _bump(reasons, "empty_department")
+            continue
+
+        payload.append({"id": rid, "department": department})
+
+    # cerrar file handle interno del reader
+    try:
+        reader.reader.f.close()  # type: ignore
+    except Exception:
+        pass
 
     with SessionLocal() as session:
         if payload:
@@ -162,23 +216,38 @@ def ingest_jobs(csv_path: Path, run_id: str) -> Dict[str, Any]:
     payload: List[Dict[str, Any]] = []
     source = csv_path.name
 
-    with csv_path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            raw = dict(row)
-            rid = _parse_int(raw.get("id"))
-            job = (raw.get("job") or "").strip()
+    reader = _open_csv_dictreader(csv_path, expected_headers=["id", "job"])
+    f = reader._fieldnames  # type: ignore[attr-defined]
+    if not f or "id" not in (f or []) or "job" not in (f or []):
+        return {
+            "source": source,
+            "table": "jobs",
+            "inserted": 0,
+            "rejected": 0,
+            "reasons": {"invalid_headers": 1, "headers_seen": 1},
+            "headers_seen": f,
+        }
 
-            if rid is None:
-                rejected += 1
-                _bump(reasons, "invalid_id")
-                continue
-            if not job:
-                rejected += 1
-                _bump(reasons, "empty_job")
-                continue
+    for row in reader:
+        raw = dict(row)
+        rid = _parse_int(raw.get("id"))
+        job = (raw.get("job") or "").strip()
 
-            payload.append({"id": rid, "job": job})
+        if rid is None:
+            rejected += 1
+            _bump(reasons, "invalid_id")
+            continue
+        if not job:
+            rejected += 1
+            _bump(reasons, "empty_job")
+            continue
+
+        payload.append({"id": rid, "job": job})
+
+    try:
+        reader.reader.f.close()  # type: ignore
+    except Exception:
+        pass
 
     with SessionLocal() as session:
         if payload:
@@ -217,32 +286,58 @@ def ingest_hired_employees(csv_path: Path, run_id: str) -> Dict[str, Any]:
     job_ids_needed = set()
     parsed_rows: List[Tuple[Dict[str, Any], int, str, datetime, int, int]] = []
 
+    reader = _open_csv_dictreader(csv_path, expected_headers=["id", "name", "datetime", "department_id", "job_id"])
+    f = reader._fieldnames  # type: ignore[attr-defined]
+    expected = {"id", "name", "datetime", "department_id", "job_id"}
+    if not f or not expected.issubset(set(f or [])):
+        return {
+            "source": source,
+            "table": "hired_employees",
+            "inserted": 0,
+            "rejected": 0,
+            "reasons": {"invalid_headers": 1, "headers_seen": 1},
+            "headers_seen": f,
+        }
+
     # 1) Validación de tipos + obligatoriedad (DD)
-    with csv_path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            raw = dict(row)
+    for row in reader:
+        raw = dict(row)
 
-            emp_id = _parse_int(raw.get("id"))
-            name = (raw.get("name") or "").strip()
-            dt = _parse_datetime(raw.get("datetime"))
-            dept_id = _parse_int(raw.get("department_id"))
-            job_id = _parse_int(raw.get("job_id"))
+        emp_id = _parse_int(raw.get("id"))
+        name = (raw.get("name") or "").strip()
+        dt = _parse_datetime(raw.get("datetime"))
+        dept_id = _parse_int(raw.get("department_id"))
+        job_id = _parse_int(raw.get("job_id"))
 
-            if emp_id is None:
-                rejects.append(("invalid_id", raw)); _bump(reasons, "invalid_id"); continue
-            if not name:
-                rejects.append(("empty_name", raw)); _bump(reasons, "empty_name"); continue
-            if dt is None:
-                rejects.append(("invalid_datetime", raw)); _bump(reasons, "invalid_datetime"); continue
-            if dept_id is None:
-                rejects.append(("missing_department_id", raw)); _bump(reasons, "missing_department_id"); continue
-            if job_id is None:
-                rejects.append(("missing_job_id", raw)); _bump(reasons, "missing_job_id"); continue
+        if emp_id is None:
+            rejects.append(("invalid_id", raw))
+            _bump(reasons, "invalid_id")
+            continue
+        if not name:
+            rejects.append(("empty_name", raw))
+            _bump(reasons, "empty_name")
+            continue
+        if dt is None:
+            rejects.append(("invalid_datetime", raw))
+            _bump(reasons, "invalid_datetime")
+            continue
+        if dept_id is None:
+            rejects.append(("missing_department_id", raw))
+            _bump(reasons, "missing_department_id")
+            continue
+        if job_id is None:
+            rejects.append(("missing_job_id", raw))
+            _bump(reasons, "missing_job_id")
+            continue
 
-            dept_ids_needed.add(dept_id)
-            job_ids_needed.add(job_id)
-            parsed_rows.append((raw, emp_id, name, dt, dept_id, job_id))
+        dept_ids_needed.add(dept_id)
+        job_ids_needed.add(job_id)
+        parsed_rows.append((raw, emp_id, name, dt, dept_id, job_id))
+
+    try:
+        reader.reader.f.close()  # type: ignore
+    except Exception:
+        pass
 
     # 2) Integridad referencial (solo IDs involucrados)
     with SessionLocal() as session:
@@ -294,7 +389,7 @@ def ingest_hired_employees(csv_path: Path, run_id: str) -> Dict[str, Any]:
                 session.execute(sql, batch)
                 inserted += len(batch)
 
-        # 4) Registrar rechazos DQ (en la misma corrida)
+        # 4) Registrar rechazos DQ
         for reason, raw in rejects:
             _reject(session, run_id, source, table_name, reason, raw)
 
