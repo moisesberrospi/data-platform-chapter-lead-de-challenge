@@ -10,6 +10,7 @@
     volumes:
       - db_data:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d
+      - ./sql:/sql
     healthcheck:
       test:
         - CMD-SHELL
@@ -17,6 +18,7 @@
       interval: 5s
       timeout: 3s
       retries: 20
+
 
   api:
     build: ./api
@@ -35,6 +37,7 @@
       - ./api:/app
       - ./data:/app/data
       - ./backups:/app/backups
+
 
 
 volumes:

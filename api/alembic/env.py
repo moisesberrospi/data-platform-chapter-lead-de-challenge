@@ -4,7 +4,8 @@ from alembic import context
 
 from src.config import settings
 from src.db import Base
-import src.models  # noqa: F401  (importa modelos para autogenerate)
+import src.models
+import src.dq_models   # noqa: F401  (importa modelos para autogenerate)
 
 config = context.config
 fileConfig(config.config_file_name)

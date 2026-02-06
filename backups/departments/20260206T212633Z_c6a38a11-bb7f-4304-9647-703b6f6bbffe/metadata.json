@@ -1,0 +1,12 @@
+{
+  "table": "departments",
+  "version": "20260206T212633Z_c6a38a11-bb7f-4304-9647-703b6f6bbffe",
+  "run_id": "c6a38a11-bb7f-4304-9647-703b6f6bbffe",
+  "created_at_utc": "20260206T212633Z",
+  "row_count": 0,
+  "format": "avro",
+  "files": {
+    "data": "data.avro",
+    "metadata": "metadata.json"
+  }
+}
