@@ -1,114 +1,149 @@
-# DECISIONS.md – Architectural Decision Records
+# 📋 DECISIONS.md – Architectural Decision Records
 
-Este documento resume las decisiones técnicas tomadas durante el desarrollo del challenge
-y el razonamiento detrás de cada una.
-
----
-## Resumen
-El challenge lo abordé como si fuera una mini data platform en producción, no solo como un ejercicio técnico.
-Primero, en la ingesta histórica, implementé un proceso batch para cargar los CSV de departments, jobs y hired_employees hacia PostgreSQL. La carga no es fila a fila, sino por lotes, para evitar locks innecesarios y mejorar throughput. Además, agregué una capa explícita de Data Quality: los registros inválidos no se descartan, sino que se persisten en una tabla de rechazos con trazabilidad por run_id, motivo del error y data original. Esto permite auditoría, reprocesos y métricas de calidad.
-Para la API REST, diseñé un endpoint único que recibe transacciones de 1 a 1000 registros para cualquiera de las tres tablas. Todas las validaciones de negocio se hacen en el servicio: tipos de datos, campos obligatorios e integridad referencial. En el caso de hired_employees, el servicio valida que los IDs de departamento y cargo existan antes de insertar, evitando empleados huérfanos. La idea fue centralizar reglas críticas y no depender de que los clientes hagan validaciones correctas.
-En cuanto a gestión de esquema, utilicé Alembic para versionar la base de datos. Esto permitió evolucionar el modelo —por ejemplo, la tabla de Data Quality— sin resets manuales, manteniendo trazabilidad y consistencia entre entornos. Para mí, el esquema también es código y debe versionarse.
-Luego implementé un framework de backup y recovery, donde cada tabla puede respaldarse en formato AVRO. Los backups son inmutables, versionados y con checksum, lo que permite restauraciones confiables y auditables. No es solo un dump, sino un artefacto de plataforma.
-Para el análisis de datos, resolví las métricas solicitadas directamente en SQL optimizado y las dejé separadas de la API. Esto permite que cualquier analista pueda ejecutar las métricas sin depender del backend.
-Finalmente, en arquitectura y observabilidad, la solución se ejecuta completamente en Docker Compose, con healthchecks, logs y trazabilidad por ejecución. Si una ingesta falla, el equipo puede saber cuándo falló, por qué y qué datos se rechazaron.
-El diseño cubre el alcance actual, pero dejé documentada una evolución natural hacia mayores volúmenes, como el uso de Polars para procesamiento, desacoplar la ingesta del API y una migración cloud-native en GCP.
----
-
-## 1. Uso de FastAPI para la API REST
-
-**Decisión:** Se utilizó FastAPI como framework web.
-
-**Motivo:**
-- Alto rendimiento
-- Tipado explícito
-- Fácil integración con Pydantic
-- Endpoints claros y auto-documentados
-
-**Alternativas consideradas:** Flask, Django REST  
-FastAPI resultó más adecuado para un servicio liviano de ingesta.
+Resumen de decisiones técnicas y el razonamiento detrás de cada una.
 
 ---
 
-## 2. PostgreSQL como base de datos
 
-**Decisión:** PostgreSQL como motor relacional.
+### Pilares de la solución:
 
-**Motivo:**
-- Soporte robusto para integridad referencial
-- Buen manejo de JSON
-- Funciones analíticas SQL
-- Estándar en entornos productivos
+#### 🔄 **Ingesta Histórica**
+- Proceso batch para cargar CSV (departments, jobs, hired_employees) hacia PostgreSQL
+- Carga por **lotes** en lugar de fila a fila → evita locks y mejora throughput
+- Capa explícita de **Data Quality**: registros inválidos se persisten en tabla de rechazos
+- Trazabilidad por `run_id`, motivo del error y dato original
 
----
+#### 🌐 **API REST**
+- Endpoint único que recibe 1 a 1000 registros para cualquier tabla
+- Validaciones centralizadas en el servicio: tipos de datos, campos obligatorios, integridad referencial
+- Para `hired_employees`: validación de IDs de departamento y cargo antes de insertar
+- Evita empleados huérfanos y reglas de negocio distribuidas
 
-## 3. Data Quality separada de la data válida
+#### 🗄️ **Gestión de Esquema**
+- **Alembic** para versionado de base de datos
+- Evolución del modelo sin resets manuales
+- Principio: el esquema es código y debe versionarse
 
-**Decisión:** Los registros inválidos no se descartan ni bloquean el proceso.
+#### 💾 **Backup & Recovery**
+- Formato **AVRO**: binario eficiente con esquema incluido
+- Backups: inmutables, versionados y con checksum
+- Restauraciones confiables y auditables
 
-**Implementación:**
-- Tabla `dq_rejections`
-- Registro por fila rechazada
-- Asociación mediante `run_id`
+#### 📊 **Análisis de Datos**
+- Métricas en SQL optimizado, separadas de la API
+- Ejecutables sin dependencia del backend
 
-**Beneficio:**
-- Auditoría
-- Reprocesamiento
-- Observabilidad real del pipeline
-
----
-
-## 4. Batch Loading para ingesta histórica
-
-**Decisión:** Carga por lotes en lugar de inserts fila a fila.
-
-**Motivo:**
-- Evita locks prolongados
-- Reduce consumo de memoria
-- Escalable para volúmenes mayores
+#### 🐳 **Infraestructura**
+- Docker Compose para reproducibilidad
+- Healthchecks, logs y trazabilidad por ejecución
+- Observabilidad: visibilidad en fallos, motivos y datos rechazados
 
 ---
 
-## 5. AVRO para Backup & Recovery
+## 1️⃣ Uso de FastAPI para la API REST
 
-**Decisión:** Backups en formato AVRO.
+| | |
+|------|------|
+| **Decisión** | FastAPI como framework web |
+| **Ventajas** | Alto rendimiento, tipado explícito, fácil integración con Pydantic |
+| **Alternativas** | Flask, Django REST |
 
-**Motivo:**
-- Formato binario eficiente
-- Incluye esquema
-
-**Criterios cumplidos:**
-- Inmutable
-- Versionado
+**Por qué FastAPI:** Framework liviano, auto-documentado y con validación automática de tipos.
 
 ---
 
-## 6. SQL separado para métricas
+## 2️⃣ PostgreSQL como base de datos
 
-**Decisión:** Queries analíticas fuera de la API.
-
-**Motivo:**
-- Separación de responsabilidades
-- Facilita revisión por analistas
-- Reproducible y auditable
+| | |
+|------|------|
+| **Decisión** | PostgreSQL como motor relacional |
+| **Ventajas** | Integridad referencial, JSON support, funciones analíticas |
+| **Estándar** | Referencia en entornos productivos |
 
 ---
 
-## 7. Docker y Docker Compose
+## 3️⃣ Data Quality separada de la data válida
 
-**Decisión:** Contenerización completa del entorno.
+### ❌ Sin esta decisión:
+- Registros inválidos se descartan
+- Pérdida de información
+- Sin posibilidad de auditoría
 
-**Motivo:**
-- Reproducibilidad
-- Onboarding rápido
-- Alineado a prácticas modernas de plataforma
+### ✅ Con esta decisión:
+- **Tabla `dq_rejections`** → registro por fila rechazada
+- **Asociación mediante `run_id`** → trazabilidad completa
+- **Motivo del error** → diagnóstico rápido
 
-## 8. Propuesta de mejora y escalabilidad
+**Beneficios:**
+- 🔍 Auditoría de calidad
+- 🔄 Reprocesamiento
+- 📊 Observabilidad real del pipeline
 
-La arquitectura actual cumple con los requerimientos del challenge y está pensada para ser clara, reproducible y observable. No obstante, si el volumen de datos creciera (por ejemplo, archivos de varios gigabytes o cargas recurrentes), se identifican las siguientes mejoras como evolución natural de la solución.
+---
 
-En la capa de ingesta, el procesamiento de archivos podría migrar de Pandas a Polars, aprovechando su ejecución paralela y menor consumo de memoria basado en Apache Arrow. Esto permitiría manejar archivos de mayor tamaño sin cambios significativos en la lógica de negocio.
+## 4️⃣ Batch Loading para ingesta histórica
 
-Adicionalmente, la ingesta batch podría desacoplarse del servicio API, dejando al API enfocado únicamente en validaciones y recepción de transacciones, mientras que los procesos de carga pesada se ejecutan como jobs independientes, facilitando paralelización y reintentos controlados.
+| aspecto | detalle |
+|--------|---------|
+| **Patrón** | Carga por lotes, no fila a fila |
+| **Beneficio 1** | Evita locks prolongados |
+| **Beneficio 2** | Reduce consumo de memoria |
+| **Escalabilidad** | Preparado para volúmenes mayores |
 
-Desde el punto de vista de infraestructura, una migración a la nube permitiría utilizar almacenamiento en objetos para datos y backups (manteniendo inmutabilidad y versionado), así como servicios administrados para la ejecución de ingestas y análisis analítico, sin modificar el modelo de Data Quality ni la trazabilidad implementada.
+---
+
+## 5️⃣ AVRO para Backup & Recovery
+
+### Características:
+- ✅ **Binario eficiente** → tamaño reducido
+- ✅ **Esquema incluido** → auto-documentado
+- ✅ **Inmutable** → sin cambios posteriores
+- ✅ **Versionado** → trazabilidad de versiones
+
+No es un dump, es un **artefacto de plataforma** restaurable y auditable.
+
+---
+
+## 6️⃣ SQL separado para métricas
+
+### Ventajas:
+| | |
+|---|---|
+| 🔀 | Separación de responsabilidades |
+| 👥 | Facilitá revisión por analistas |
+| 📝 | Reproducible y auditable |
+
+Las queries analíticas son independientes del API → cualquiera puede ejecutarlas.
+
+---
+
+## 7️⃣ Docker y Docker Compose
+
+### Justificación:
+```
+Reproducibilidad   ✓
+Onboarding rápido  ✓
+DevOps moderno     ✓
+```
+
+---
+
+## 8️⃣ Propuesta de mejora y escalabilidad
+
+### 📈 Si el volumen crece...
+
+#### **Ingesta: Pandas → Polars**
+- Ejecución paralela
+- Menor consumo de memoria (Apache Arrow)
+- Transparente para la lógica de negocio
+
+#### **Desacoplamiento API ↔ Ingesta**
+- API: validaciones + transacciones
+- Jobs: procesamiento pesado
+- Resultado: paralelización y reintentos controlados
+
+#### **Migración Cloud-Native (GCP)**
+- 🗄️ Cloud Storage para datos y backups
+- ✅ Inmutabilidad y versionado mantenidos
+- 📊 Servicios administrados para ingestas
+- 🔍 Sin cambios en Data Quality ni trazabilidad
