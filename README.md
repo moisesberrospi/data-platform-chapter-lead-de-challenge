@@ -35,6 +35,7 @@ Requisitos:
 
 ```powershell
 docker compose up -d --build
+```
 
 ---
 
