@@ -34,3 +34,4 @@
 
 volumes:
   db_data:
+  - ./api:/app
