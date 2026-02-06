@@ -33,6 +33,9 @@
         condition: service_healthy
     volumes:
       - ./api:/app
+      - ./data:/app/data
+      - ./backups:/app/backups
+
 
 volumes:
   db_data: {}

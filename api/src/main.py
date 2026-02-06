@@ -7,6 +7,8 @@ from src.schemas import TransactionRequest
 from src.transaction_service import process_transaction
 from fastapi import HTTPException
 from src.db import engine
+from src.backup_service import backup_table, restore_table
+from fastapi import Query
 
 app = FastAPI(title="Reto Chapter Lead Data Engineer")
 
@@ -47,3 +49,11 @@ def transactions(req: TransactionRequest):
         raise HTTPException(status_code=400, detail=result)
 
     return result
+
+@app.post("/backup/{table}")
+def backup_endpoint(table: str):
+    return backup_table(table)
+
+@app.post("/restore/{table}")
+def restore_endpoint(table: str, version: str = Query(...), mode: str = Query("truncate_insert")):
+    return restore_table(table, version, mode=mode)
