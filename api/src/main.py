@@ -6,7 +6,6 @@ from pathlib import Path
 from src.schemas import TransactionRequest
 from src.transaction_service import process_transaction
 from fastapi import HTTPException
-
 from src.db import engine
 
 app = FastAPI(title="Reto Chapter Lead Data Engineer")

@@ -1,48 +1,72 @@
 ﻿import csv
-import hashlib
 import json
+import os
 import uuid
+import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.db import SessionLocal
 
-# CSV montados en el contenedor (docker-compose: ./data:/app/data)
-DATA_DIR = Path("/app/data")
+
+# =========================
+# Config
+# =========================
+DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
+
+T = TypeVar("T")
 
 
-def _parse_int(value: Any) -> Optional[int]:
-    if value is None:
+def chunked(items: List[T], size: int) -> Iterable[List[T]]:
+    """Divide una lista en lotes para evitar inserts gigantes (locks/memoria)."""
+    if size <= 0:
+        yield items
+        return
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+# =========================
+# Helpers DQ
+# =========================
+def _bump(reasons: Dict[str, int], key: str) -> None:
+    reasons[key] = reasons.get(key, 0) + 1
+
+
+def _parse_int(v: Any) -> Optional[int]:
+    if v is None:
         return None
-    v = str(value).strip()
-    if v == "":
+    s = str(v).strip()
+    if s == "":
         return None
     try:
-        return int(v)
+        return int(s)
     except ValueError:
         return None
 
 
-def _parse_datetime(value: Any) -> Optional[datetime]:
-    if value is None:
+def _parse_datetime(v: Any) -> Optional[datetime]:
+    """Parse ISO-8601 con tolerancia a sufijo Z."""
+    if v is None:
         return None
-    v = str(value).strip()
-    if v == "":
+    s = str(v).strip()
+    if s == "":
         return None
     try:
-        # soporta "2021-01-01T00:00:00Z"
-        if v.endswith("Z"):
-            v = v[:-1]
-        return datetime.fromisoformat(v)
+        if s.endswith("Z"):
+            s = s[:-1]
+        return datetime.fromisoformat(s)
     except ValueError:
         return None
 
 
 def _stable_hash(row_data: Dict[str, Any]) -> str:
+    """Hash estable (sha256) sobre JSON ordenado para deduplicación por corrida."""
     payload = json.dumps(row_data, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -55,6 +79,12 @@ def _reject(
     reason: str,
     row_data: Dict[str, Any],
 ) -> None:
+    """
+    Registra rechazo DQ.
+    - row_data se envía como string JSON para evitar "can't adapt type 'dict'"
+    - CAST(:row_data AS json) evita problemas con :row_data::json en algunos parsers
+    - ON CONFLICT evita duplicados por (run_id,row_hash,reason)
+    """
     row_hash = _stable_hash(row_data)
     row_data_json = json.dumps(row_data, ensure_ascii=False)
 
@@ -75,199 +105,206 @@ def _reject(
     )
 
 
-
-
-def ingest_departments(csv_path: Path, run_id: Optional[str] = None) -> Dict[str, Any]:
-    run_id = run_id or str(uuid.uuid4())
-
-    inserted_attempted = 0
-    rejected = 0
+# =========================
+# Ingest CSV -> DB
+# =========================
+def ingest_departments(csv_path: Path, run_id: str) -> Dict[str, Any]:
     reasons: Dict[str, int] = {}
+    inserted = 0
+    rejected = 0
+    payload: List[Dict[str, Any]] = []
+    source = csv_path.name
 
-    def bump(reason: str):
-        nonlocal rejected
-        rejected += 1
-        reasons[reason] = reasons.get(reason, 0) + 1
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            raw = dict(row)
+            rid = _parse_int(raw.get("id"))
+            department = (raw.get("department") or "").strip()
+
+            if rid is None:
+                rejected += 1
+                _bump(reasons, "invalid_id")
+                continue
+            if not department:
+                rejected += 1
+                _bump(reasons, "empty_department")
+                continue
+
+            payload.append({"id": rid, "department": department})
 
     with SessionLocal() as session:
-        with csv_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                raw = {
-                    "id": row[0] if len(row) > 0 else None,
-                    "department": row[1] if len(row) > 1 else None,
-                }
-
-                dept_id = _parse_int(raw["id"])
-                dept_name = (raw["department"] or "").strip()
-
-                if dept_id is None:
-                    bump("invalid_id")
-                    _reject(session, run_id, csv_path.name, "departments", "invalid_id", raw)
-                    continue
-
-                if not dept_name:
-                    bump("empty_department")
-                    _reject(session, run_id, csv_path.name, "departments", "empty_department", raw)
-                    continue
-
-                session.execute(
-                    text(
-                        "INSERT INTO departments (id, department) VALUES (:id, :department) "
-                        "ON CONFLICT (id) DO NOTHING"
-                    ),
-                    {"id": dept_id, "department": dept_name},
-                )
-                inserted_attempted += 1
+        if payload:
+            sql = text(
+                "INSERT INTO departments (id, department) "
+                "VALUES (:id, :department) "
+                "ON CONFLICT (id) DO NOTHING"
+            )
+            for batch in chunked(payload, BATCH_SIZE):
+                session.execute(sql, batch)
+                inserted += len(batch)
 
         session.commit()
 
     return {
-        "run_id": run_id,
-        "source": csv_path.name,
+        "source": source,
         "table": "departments",
-        "inserted_attempted": inserted_attempted,
+        "inserted": inserted,
         "rejected": rejected,
         "reasons": reasons,
     }
 
 
-def ingest_jobs(csv_path: Path, run_id: Optional[str] = None) -> Dict[str, Any]:
-    run_id = run_id or str(uuid.uuid4())
-
-    inserted_attempted = 0
-    rejected = 0
+def ingest_jobs(csv_path: Path, run_id: str) -> Dict[str, Any]:
     reasons: Dict[str, int] = {}
+    inserted = 0
+    rejected = 0
+    payload: List[Dict[str, Any]] = []
+    source = csv_path.name
 
-    def bump(reason: str):
-        nonlocal rejected
-        rejected += 1
-        reasons[reason] = reasons.get(reason, 0) + 1
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            raw = dict(row)
+            rid = _parse_int(raw.get("id"))
+            job = (raw.get("job") or "").strip()
+
+            if rid is None:
+                rejected += 1
+                _bump(reasons, "invalid_id")
+                continue
+            if not job:
+                rejected += 1
+                _bump(reasons, "empty_job")
+                continue
+
+            payload.append({"id": rid, "job": job})
 
     with SessionLocal() as session:
-        with csv_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                raw = {
-                    "id": row[0] if len(row) > 0 else None,
-                    "job": row[1] if len(row) > 1 else None,
-                }
-
-                job_id = _parse_int(raw["id"])
-                job_name = (raw["job"] or "").strip()
-
-                if job_id is None:
-                    bump("invalid_id")
-                    _reject(session, run_id, csv_path.name, "jobs", "invalid_id", raw)
-                    continue
-
-                if not job_name:
-                    bump("empty_job")
-                    _reject(session, run_id, csv_path.name, "jobs", "empty_job", raw)
-                    continue
-
-                session.execute(
-                    text(
-                        "INSERT INTO jobs (id, job) VALUES (:id, :job) "
-                        "ON CONFLICT (id) DO NOTHING"
-                    ),
-                    {"id": job_id, "job": job_name},
-                )
-                inserted_attempted += 1
+        if payload:
+            sql = text(
+                "INSERT INTO jobs (id, job) "
+                "VALUES (:id, :job) "
+                "ON CONFLICT (id) DO NOTHING"
+            )
+            for batch in chunked(payload, BATCH_SIZE):
+                session.execute(sql, batch)
+                inserted += len(batch)
 
         session.commit()
 
     return {
-        "run_id": run_id,
-        "source": csv_path.name,
+        "source": source,
         "table": "jobs",
-        "inserted_attempted": inserted_attempted,
+        "inserted": inserted,
         "rejected": rejected,
         "reasons": reasons,
     }
 
 
-def ingest_hired_employees(csv_path: Path, run_id: Optional[str] = None) -> Dict[str, Any]:
-    run_id = run_id or str(uuid.uuid4())
-
-    inserted_attempted = 0
-    rejected = 0
+def ingest_hired_employees(csv_path: Path, run_id: str) -> Dict[str, Any]:
     reasons: Dict[str, int] = {}
+    inserted = 0
+    rejected = 0
 
-    def bump(reason: str):
-        nonlocal rejected
-        rejected += 1
-        reasons[reason] = reasons.get(reason, 0) + 1
+    source = csv_path.name
+    table_name = "hired_employees"
 
+    valid_rows: List[Dict[str, Any]] = []
+    rejects: List[Tuple[str, Dict[str, Any]]] = []
+
+    dept_ids_needed = set()
+    job_ids_needed = set()
+    parsed_rows: List[Tuple[Dict[str, Any], int, str, datetime, int, int]] = []
+
+    # 1) Validación de tipos + obligatoriedad (DD)
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            raw = dict(row)
+
+            emp_id = _parse_int(raw.get("id"))
+            name = (raw.get("name") or "").strip()
+            dt = _parse_datetime(raw.get("datetime"))
+            dept_id = _parse_int(raw.get("department_id"))
+            job_id = _parse_int(raw.get("job_id"))
+
+            if emp_id is None:
+                rejects.append(("invalid_id", raw)); _bump(reasons, "invalid_id"); continue
+            if not name:
+                rejects.append(("empty_name", raw)); _bump(reasons, "empty_name"); continue
+            if dt is None:
+                rejects.append(("invalid_datetime", raw)); _bump(reasons, "invalid_datetime"); continue
+            if dept_id is None:
+                rejects.append(("missing_department_id", raw)); _bump(reasons, "missing_department_id"); continue
+            if job_id is None:
+                rejects.append(("missing_job_id", raw)); _bump(reasons, "missing_job_id"); continue
+
+            dept_ids_needed.add(dept_id)
+            job_ids_needed.add(job_id)
+            parsed_rows.append((raw, emp_id, name, dt, dept_id, job_id))
+
+    # 2) Integridad referencial (solo IDs involucrados)
     with SessionLocal() as session:
-        # Para este tamaño está OK cargar en memoria.
-        # Para 10GB: validar FK vía JOIN/SQL set-based o staging + constraints.
-        dept_ids = {r[0] for r in session.execute(text("SELECT id FROM departments")).fetchall()}
-        job_ids = {r[0] for r in session.execute(text("SELECT id FROM jobs")).fetchall()}
+        existing_depts = set()
+        existing_jobs = set()
 
-        with csv_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                raw = {
-                    "id": row[0] if len(row) > 0 else None,
-                    "name": row[1] if len(row) > 1 else None,
-                    "datetime": row[2] if len(row) > 2 else None,
-                    "department_id": row[3] if len(row) > 3 else None,
-                    "job_id": row[4] if len(row) > 4 else None,
+        if dept_ids_needed:
+            rows_dept = session.execute(
+                text("SELECT id FROM departments WHERE id = ANY(:ids)"),
+                {"ids": list(dept_ids_needed)},
+            ).fetchall()
+            existing_depts = {x[0] for x in rows_dept}
+
+        if job_ids_needed:
+            rows_job = session.execute(
+                text("SELECT id FROM jobs WHERE id = ANY(:ids)"),
+                {"ids": list(job_ids_needed)},
+            ).fetchall()
+            existing_jobs = {x[0] for x in rows_job}
+
+        for raw, emp_id, name, dt, dept_id, job_id in parsed_rows:
+            if dept_id not in existing_depts:
+                rejects.append(("department_fk_not_found", raw))
+                _bump(reasons, "department_fk_not_found")
+                continue
+            if job_id not in existing_jobs:
+                rejects.append(("job_fk_not_found", raw))
+                _bump(reasons, "job_fk_not_found")
+                continue
+
+            valid_rows.append(
+                {
+                    "id": emp_id,
+                    "name": name,
+                    "datetime": dt,
+                    "department_id": dept_id,
+                    "job_id": job_id,
                 }
+            )
 
-                emp_id = _parse_int(raw["id"])
-                name = (raw["name"] or "").strip()
-                dt = _parse_datetime(raw["datetime"])
-                department_id = _parse_int(raw["department_id"])
-                job_id = _parse_int(raw["job_id"])
+        # 3) Insert por lotes (Batch Loading)
+        if valid_rows:
+            sql = text(
+                "INSERT INTO hired_employees (id, name, datetime, department_id, job_id) "
+                "VALUES (:id, :name, :datetime, :department_id, :job_id) "
+                "ON CONFLICT (id) DO NOTHING"
+            )
+            for batch in chunked(valid_rows, BATCH_SIZE):
+                session.execute(sql, batch)
+                inserted += len(batch)
 
-                if emp_id is None:
-                    bump("invalid_id")
-                    _reject(session, run_id, csv_path.name, "hired_employees", "invalid_id", raw)
-                    continue
-                if not name:
-                    bump("empty_name")
-                    _reject(session, run_id, csv_path.name, "hired_employees", "empty_name", raw)
-                    continue
-                if dt is None:
-                    bump("invalid_datetime")
-                    _reject(session, run_id, csv_path.name, "hired_employees", "invalid_datetime", raw)
-                    continue
+        # 4) Registrar rechazos DQ (en la misma corrida)
+        for reason, raw in rejects:
+            _reject(session, run_id, source, table_name, reason, raw)
 
-                if department_id is not None and department_id not in dept_ids:
-                    bump("department_fk_not_found")
-                    _reject(session, run_id, csv_path.name, "hired_employees", "department_fk_not_found", raw)
-                    continue
-
-                if job_id is not None and job_id not in job_ids:
-                    bump("job_fk_not_found")
-                    _reject(session, run_id, csv_path.name, "hired_employees", "job_fk_not_found", raw)
-                    continue
-
-                session.execute(
-                    text(
-                        "INSERT INTO hired_employees (id, name, datetime, department_id, job_id) "
-                        "VALUES (:id, :name, :datetime, :department_id, :job_id) "
-                        "ON CONFLICT (id) DO NOTHING"
-                    ),
-                    {
-                        "id": emp_id,
-                        "name": name,
-                        "datetime": dt,
-                        "department_id": department_id,
-                        "job_id": job_id,
-                    },
-                )
-                inserted_attempted += 1
-
+        rejected = len(rejects)
         session.commit()
 
     return {
-        "run_id": run_id,
-        "source": csv_path.name,
+        "source": source,
         "table": "hired_employees",
-        "inserted_attempted": inserted_attempted,
+        "inserted": inserted,
         "rejected": rejected,
         "reasons": reasons,
     }
@@ -275,7 +312,10 @@ def ingest_hired_employees(csv_path: Path, run_id: Optional[str] = None) -> Dict
 
 def ingest_all(data_dir: Path = DATA_DIR) -> Dict[str, Any]:
     """
-    Ejecuta toda la ingesta con un run_id único para trazabilidad.
+    Ingesta histórica desde CSV:
+    - departments.csv
+    - jobs.csv
+    - hired_employees.csv
     """
     run_id = str(uuid.uuid4())
 
