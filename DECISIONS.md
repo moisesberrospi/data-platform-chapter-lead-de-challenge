@@ -4,6 +4,16 @@ Este documento resume las decisiones técnicas tomadas durante el desarrollo del
 y el razonamiento detrás de cada una.
 
 ---
+## Resumen
+El challenge lo abordé como si fuera una mini data platform en producción, no solo como un ejercicio técnico.
+Primero, en la ingesta histórica, implementé un proceso batch para cargar los CSV de departments, jobs y hired_employees hacia PostgreSQL. La carga no es fila a fila, sino por lotes, para evitar locks innecesarios y mejorar throughput. Además, agregué una capa explícita de Data Quality: los registros inválidos no se descartan, sino que se persisten en una tabla de rechazos con trazabilidad por run_id, motivo del error y data original. Esto permite auditoría, reprocesos y métricas de calidad.
+Para la API REST, diseñé un endpoint único que recibe transacciones de 1 a 1000 registros para cualquiera de las tres tablas. Todas las validaciones de negocio se hacen en el servicio: tipos de datos, campos obligatorios e integridad referencial. En el caso de hired_employees, el servicio valida que los IDs de departamento y cargo existan antes de insertar, evitando empleados huérfanos. La idea fue centralizar reglas críticas y no depender de que los clientes hagan validaciones correctas.
+En cuanto a gestión de esquema, utilicé Alembic para versionar la base de datos. Esto permitió evolucionar el modelo —por ejemplo, la tabla de Data Quality— sin resets manuales, manteniendo trazabilidad y consistencia entre entornos. Para mí, el esquema también es código y debe versionarse.
+Luego implementé un framework de backup y recovery, donde cada tabla puede respaldarse en formato AVRO. Los backups son inmutables, versionados y con checksum, lo que permite restauraciones confiables y auditables. No es solo un dump, sino un artefacto de plataforma.
+Para el análisis de datos, resolví las métricas solicitadas directamente en SQL optimizado y las dejé separadas de la API. Esto permite que cualquier analista pueda ejecutar las métricas sin depender del backend.
+Finalmente, en arquitectura y observabilidad, la solución se ejecuta completamente en Docker Compose, con healthchecks, logs y trazabilidad por ejecución. Si una ingesta falla, el equipo puede saber cuándo falló, por qué y qué datos se rechazaron.
+El diseño cubre el alcance actual, pero dejé documentada una evolución natural hacia mayores volúmenes, como el uso de Polars para procesamiento, desacoplar la ingesta del API y una migración cloud-native en GCP.
+---
 
 ## 1. Uso de FastAPI para la API REST
 
@@ -66,12 +76,10 @@ FastAPI resultó más adecuado para un servicio liviano de ingesta.
 **Motivo:**
 - Formato binario eficiente
 - Incluye esquema
-- Muy usado en data engineering
 
 **Criterios cumplidos:**
 - Inmutable
 - Versionado
-- Checksum SHA256
 
 ---
 
